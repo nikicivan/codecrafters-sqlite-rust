@@ -1,5 +1,5 @@
 use crate::db::db::Database;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use db::sql::SqlStatement;
 use std::fs::File;
 use std::io::prelude::*;
@@ -53,12 +53,18 @@ fn main() -> Result<()> {
             println!("{}", db.table_names().join(" "));
         }
         query => {
-            let query = query.to_lowercase();
             let mut index = 0;
 
             let db = Database::read_from_bytes(&contents, &mut index)?;
 
-            let query = SqlStatement::from_str(&query)?;
+            #[cfg(debug_assertions)]
+            eprintln!("Parsing query: {}", query);
+            let query =
+                SqlStatement::from_str(&query).with_context(|| "main: Failed to parse query")?;
+
+            #[cfg(debug_assertions)]
+            println!("Executing query: {:?}", query);
+
             let result = db.run_query(query)?;
 
             for row in result {

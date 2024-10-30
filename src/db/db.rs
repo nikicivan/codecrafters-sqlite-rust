@@ -1,9 +1,9 @@
 use crate::{
-    db::sql::{Selection, SqlStatement},
+    db::sql::{Condition, Selection, SimpleCondition, SqlStatement, SqlValue},
     utils::utils::ReadFromBytes,
 };
 use anyhow::{anyhow, bail, Context, Result};
-use std::collections::HashMap;
+use std::{collections::HashMap, str::FromStr};
 use thiserror::Error;
 
 const MAGIC_STRING_LEN: usize = 16;
@@ -540,6 +540,8 @@ impl Cell {
     }
 }
 
+type Row = HashMap<String, SerialType>;
+
 #[derive(Debug)]
 pub struct TableData {
     #[allow(dead_code)]
@@ -549,33 +551,39 @@ pub struct TableData {
     pub root_page: u8,
     #[allow(dead_code)]
     sql: String,
-    pub data: Vec<HashMap<String, SerialType>>,
+    pub data: Vec<Row>,
+    pub column_names: Vec<String>,
 }
 
 impl TableData {
     pub fn read(cols: &Vec<SerialType>, db_header: &DatabaseHeader, bytes: &[u8]) -> Result<Self> {
         #[cfg(debug_assertions)]
         eprintln!("TableData::try_from({:?})", cols);
+
         match &cols[0] {
             SerialType::Text(name) if name == "table" => {}
             SerialType::Text(name) => bail!("Expected type to be \"table\", got {name:?}"),
             _ => bail!("Expected type to be a text"),
         };
+
         let name = match &cols[1] {
             SerialType::Text(name) => name,
             _ => bail!("Expected table name to be a text"),
         }
         .clone();
+
         let table_name = match &cols[2] {
             SerialType::Text(table_name) => table_name,
             _ => bail!("Expected table name to be a text"),
         }
         .clone();
+
         let root_page = match &cols[3] {
             SerialType::U8(root_page) => root_page,
             _ => bail!("Expected root page to be a u8"),
         }
         .clone();
+
         let sql = match &cols[4] {
             SerialType::Text(sql) => sql,
             _ => bail!("Expected SQL to be a text"),
@@ -583,24 +591,23 @@ impl TableData {
         .clone()
         .trim()
         .to_string();
-        let prefix = format!("CREATE TABLE {table_name}");
-        assert!(sql.starts_with(&prefix));
-        let column_names: Vec<String> = {
-            let sql = sql[prefix.len()..].trim().to_string();
-            assert_eq!(&sql[0..=0], "(");
-            assert_eq!(&sql[sql.len() - 1..], ")");
-            sql[1..sql.len() - 1]
-                .split(',')
-                .map(|s| s.trim().split(' ').next().unwrap().to_string())
-                .collect()
-        };
+
+        let column_names =
+            if let SqlStatement::CreateTable(create_table) = SqlStatement::from_str(&sql)? {
+                create_table.columns
+            } else {
+                bail!("Expected SQL to be a CREATE TABLE statement");
+            };
+
         let page_offset = usize::from(root_page - 1) * usize::from(db_header.page_size);
+
         let Page::LeafTable(LeafTable { cells, .. }) = Page::read_from_bytes(
             bytes,
             &mut page_offset.clone(),
             &db_header.database_text_encoding,
             page_offset,
         )?;
+
         let data = cells
             .into_iter()
             .map(|cell| {
@@ -609,12 +616,14 @@ impl TableData {
                     .collect::<HashMap<_, _>>()
             })
             .collect::<Vec<_>>();
+
         Ok(Self {
             name,
             table_name,
             root_page,
             sql,
             data,
+            column_names,
         })
     }
 }
@@ -646,6 +655,40 @@ impl ReadFromBytes for Database {
     }
 }
 
+impl PartialEq<SqlValue> for SerialType {
+    fn eq(&self, other: &SqlValue) -> bool {
+        match (self, other) {
+            (SerialType::Null, _) => false,
+            (SerialType::F64(_), _) => false,
+            (SerialType::I0, _) => false,
+            (SerialType::I1, _) => false,
+            (SerialType::Blob(_), _) => false,
+            (SerialType::U8(a), SqlValue::Integer(b)) => i128::from(*a) == *b,
+            (SerialType::U16(a), SqlValue::Integer(b)) => i128::from(*a) == *b,
+            (SerialType::U24(a), SqlValue::Integer(b)) => i128::from(*a) == *b,
+            (SerialType::U32(a), SqlValue::Integer(b)) => i128::from(*a) == *b,
+            (SerialType::U48(a), SqlValue::Integer(b)) => i128::from(*a) == *b,
+            (SerialType::U64(a), SqlValue::Integer(b)) => i128::from(*a) == *b,
+            (SerialType::Text(a), SqlValue::String(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+fn evaluate_condition(row: &Row, condition: &Condition) -> bool {
+    match condition {
+        Condition::Simple(condition) => match condition {
+            SimpleCondition::Equal(column, value) => row.get(column).map_or(false, |v| v == value),
+        },
+        Condition::And(left, right) => {
+            evaluate_condition(row, left) && evaluate_condition(row, right)
+        }
+        Condition::Or(left, right) => {
+            evaluate_condition(row, left) || evaluate_condition(row, right)
+        }
+    }
+}
+
 impl Database {
     pub fn table_names(&self) -> Vec<String> {
         self.schema_page
@@ -669,36 +712,52 @@ impl Database {
         #[cfg(debug_assertions)]
         eprintln!("table: {:?}", table);
 
+        let rows = table.data.iter().filter(|row| {
+            if let Some(condition) = &select_stmt.condition {
+                evaluate_condition(row, condition)
+            } else {
+                true
+            }
+        });
+
         if let Some(Selection::Count) = select_stmt.selections.first() {
             if select_stmt.selections.len() != 1 {
                 bail!("When COUNT(*) is selected, it must be the only selection");
             }
-            Ok(vec![vec![SerialType::U64(table.data.len() as u64)]])
+            Ok(vec![vec![SerialType::U64(rows.count() as u64)]])
         } else {
-            table
-                .data
-                .iter()
-                .map(|row| {
-                    Ok(select_stmt
-                        .selections
-                        .iter()
-                        .map(|selection| -> Result<Vec<_>, _> {
-                            Ok(match selection {
-                                Selection::All => row.values().cloned().collect(),
-                                Selection::Count => {
-                                    bail!("COUNT(*) must be the only selection")
-                                }
-                                Selection::Column(name) => {
-                                    vec![row.get(name).cloned().unwrap_or(SerialType::Null)]
-                                }
-                            })
+            rows.map(|row| {
+                Ok(select_stmt
+                    .selections
+                    .iter()
+                    .map(|selection| -> Result<Vec<_>, _> {
+                        Ok(match selection {
+                            Selection::All => table
+                                .column_names
+                                .iter()
+                                .map(|col| {
+                                    row.get(col)
+                                        .cloned()
+                                        .ok_or_else(|| anyhow!("Column not found"))
+                                })
+                                .collect::<Result<_, _>>()
+                                .with_context(|| {
+                                    "Unreachable: Column not found for 'SELECT *' statement"
+                                })?,
+                            Selection::Count => {
+                                bail!("COUNT(*) must be the only selection")
+                            }
+                            Selection::Column(name) => {
+                                vec![row.get(name).cloned().unwrap_or(SerialType::Null)]
+                            }
                         })
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>())
-                })
-                .collect::<Result<_, _>>()
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>())
+            })
+            .collect::<Result<_, _>>()
         }
     }
 }
