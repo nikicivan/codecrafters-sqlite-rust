@@ -1,10 +1,7 @@
 use crate::db::db::Database;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use db::sql::SqlStatement;
-use std::fs::File;
-use std::io::prelude::*;
-use std::str::FromStr;
-use utils::utils::ReadFromBytes;
+use std::{fs::File, io::prelude::*, str::FromStr};
 
 mod db;
 mod utils;
@@ -39,15 +36,40 @@ fn main() -> Result<()> {
 
             let db = Database::read_from_bytes(&contents, &mut index)?;
 
-            println!("database page size: {}", db.header.page_size);
-            println!("number of tables: {}", db.sqlite_schema_table()?.data.len());
+            println!("database page size: {}", db.page_size());
+
+            let query_result: u64 = db
+                .run_query(SqlStatement::from_str(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table'",
+                )?)?
+                .into_iter()
+                .flatten()
+                .next()
+                .expect("query result not found")
+                .try_into()
+                .expect("query result not an integer");
+
+            println!("number of tables: {}", query_result);
         }
         ".tables" => {
             let mut index = 0;
 
             let db = Database::read_from_bytes(&contents, &mut index)?;
 
-            println!("{}", db.table_names()?.join(" "));
+            let query_result: Vec<_> = db
+                .run_query(SqlStatement::from_str(
+                    "SELECT tbl_name FROM sqlite_schema WHERE type = 'table'",
+                )?)?
+                .into_iter()
+                .flatten()
+                .map(|row| {
+                    row.try_as_text()
+                        .ok_or_else(|| anyhow!("Expected 'tbl_name' column to be a text"))
+                })
+                .collect::<Result<_, _>>()
+                .expect("query result not an integer");
+
+            println!("{}", query_result.join(" "));
         }
         query => {
             let mut index = 0;

@@ -6,9 +6,13 @@ pub trait ReadFromBytes: Sized {
 
 impl ReadFromBytes for u8 {
     fn read_from_bytes(bytes: &[u8], index: &mut usize) -> Result<Self> {
-        let value = bytes[*index];
+        let value = bytes
+            .get(*index)
+            .ok_or_else(|| anyhow::anyhow!("Failed to read u8: index out of bounds"))?;
+
         *index += 1;
-        Ok(value)
+
+        Ok(*value)
     }
 }
 

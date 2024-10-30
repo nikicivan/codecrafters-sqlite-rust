@@ -1,15 +1,16 @@
 use anyhow::{anyhow, bail, Context, Result};
 use itertools::*;
 use std::iter::Peekable;
-use std::str::FromStr;
+use std::{collections::HashSet, str::FromStr};
 use strum::{EnumIter, EnumString, EnumTryAs, IntoEnumIterator};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, EnumTryAs)]
 pub enum SqlStatement {
     Select(SelectStatement),
     #[allow(dead_code)]
     Create,
     CreateTable(CreateTableStatement),
+    CreateIndex(CreateIndexStatement),
 }
 
 #[derive(Debug, PartialEq)]
@@ -31,11 +32,36 @@ pub enum Condition {
     Simple(SimpleCondition),
 }
 
+impl Condition {
+    pub fn columns(&self) -> HashSet<&str> {
+        let mut columns = HashSet::new();
+
+        match self {
+            Condition::And(left, right) | Condition::Or(left, right) => {
+                columns.extend(left.columns());
+                columns.extend(right.columns());
+            }
+            Condition::Simple(SimpleCondition::Equal(column, _)) => {
+                columns.insert(column);
+            }
+        }
+
+        columns
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct SelectStatement {
     pub table_name: String,
     pub selections: Vec<Selection>,
     pub condition: Option<Condition>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct CreateIndexStatement {
+    pub index_name: String,
+    pub table_name: String,
+    pub columns: Vec<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -104,6 +130,10 @@ enum SqlKeyword {
     Autoincrement,
     #[strum(serialize = "PRIMARY KEY")]
     PrimaryKey,
+    #[strum(serialize = "ON")]
+    On,
+    #[strum(serialize = "INDEX")]
+    Index,
 }
 
 fn is_valid_identifier_char(c: char) -> bool {
@@ -255,123 +285,187 @@ fn read_condition<T: Iterator<Item = SqlToken>>(iter: &mut Peekable<T>) -> Resul
 impl SqlStatement {
     fn from_tokens<T: Iterator<Item = SqlToken>>(iter: T) -> Result<Self> {
         let mut iter = iter.peekable();
-
+        
         let keyword = match iter.next() {
             Some(SqlToken::Keyword(keyword)) => keyword,
-            Some(token) => return Err(anyhow!("Expected keyword. got {token:?}")),
+            Some(token) => return Err(anyhow!("Expected keyword, got {token:?}")),
             None => bail!("Expected keyword, got EOF"),
         };
-
+        
         match keyword {
             SqlKeyword::Create => {
-                iter.next_if_eq(&SqlToken::Keyword(SqlKeyword::Table))
-                    .ok_or_else(|| anyhow!("Expected TABLE after CREATE"))?;
-
-                let table_name = match iter.next() {
-                    Some(SqlToken::Reference(table_name)) => table_name,
-                    Some(token) => bail!("Expected table name, got {token:?}"),
-                    None => bail!("Expected table name, got EOF"),
-                };
-
-                iter.next_if_eq(&SqlToken::FixedWidth(SqlFixedWidthToken::LeftParen))
-                    .ok_or_else(|| anyhow!("Expected '(' after CREATE TABLE"))?;
-
-                let columns = std::iter::from_fn({
-                    let mut iter = iter.by_ref().peeking_take_while(|token| match token {
-                        SqlToken::FixedWidth(SqlFixedWidthToken::RightParen) => false,
-                        _ => true,
-                    });
-
-                    move || {
-                        let name = match iter.next()? {
-                            SqlToken::Reference(column) => column.clone(),
-                            token => return Some(Err(anyhow!("Expected column, got {token:?}"))),
+                let next_keyword = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("Expected keyword after CREATE"))?
+                    .try_as_keyword()
+                    .with_context(|| "Expected keyword after CREATE")?;
+                
+                match next_keyword {
+                    SqlKeyword::Table => {
+                        let table_name = match iter.next() {
+                            Some(SqlToken::Reference(table_name)) => table_name,
+                            Some(token) => bail!("Expected table name, got {token:?}"),
+                            None => bail!("Expected table name, got EOF"),
                         };
-
-                        let mut iter = iter.by_ref().take_while(|token| match token {
-                            SqlToken::FixedWidth(SqlFixedWidthToken::Comma) => false,
-                            _ => true,
-                        });
-
-                        let mut is_nullable = true;
-                        let mut is_autoincrement = false;
-                        let mut is_primary_key = false;
-                        let data_type = iter
-                            .next()
-                            .map(|token| {
-                                token.try_as_reference_ref().cloned().ok_or_else(|| {
-                                    anyhow!("Expected data type to be reference, got {token:?}")
-                                })
-                            })
-                            .transpose();
-
-                        let data_type = match data_type {
-                            Ok(data_type) => data_type,
-                            Err(e) => return Some(Err(e)),
-                        };
-
-                        for token in iter {
-                            match token {
-                                SqlToken::Keyword(SqlKeyword::NotNull) => {
-                                    is_nullable = false;
+            
+                        iter.next_if_eq(&SqlToken::FixedWidth(SqlFixedWidthToken::LeftParen))
+                            .ok_or_else(|| anyhow!("Expected '(' after CREATE TABLE"))?;
+                
+                        let columns = std::iter::from_fn({
+                            let mut iter = iter.by_ref().peeking_take_while(|token| match token {
+                                SqlToken::FixedWidth(SqlFixedWidthToken::RightParen) => false,
+                                _ => true,
+                            });
+                            
+                            move || {
+                                let name = match iter.next()? {
+                                    SqlToken::Reference(column) => column.clone(),
+                                    token => return Some(Err(anyhow!("Expected column, got {token:?}"))),
+                                };
+                                
+                                let mut iter = iter.by_ref().take_while(|token| match token {
+                                    SqlToken::FixedWidth(SqlFixedWidthToken::Comma) => false,
+                                    _ => true,
+                                });
+                                
+                                let mut is_nullable = true;
+                                let mut is_autoincrement = false;
+                                let mut is_primary_key = false;
+                                
+                                let data_type = iter
+                                    .next()
+                                    .map(|token| {
+                                        token.try_as_reference_ref().cloned().ok_or_else(|| {
+                                            anyhow!("Expected data type to be reference, got {token:?}")
+                                        })
+                                    })
+                                    .transpose();
+                                
+                                let data_type = match data_type {
+                                    Ok(data_type) => data_type,
+                                    Err(e) => return Some(Err(e)),
+                                };
+                                
+                                for token in iter {
+                                    match token {
+                                        SqlToken::Keyword(SqlKeyword::NotNull) => {
+                                            is_nullable = false;
+                                        }
+                                        SqlToken::Keyword(SqlKeyword::Autoincrement) => {
+                                            is_autoincrement = true;
+                                        }
+                                        SqlToken::Keyword(SqlKeyword::PrimaryKey) => {
+                                            is_primary_key = true;
+                                        }
+                                        token => {
+                                            return Some(Err(anyhow!(
+                                                "Expected NOT NULL, AUTOINCREMENT, or PRIMARY KEY, got {token:?}"
+                                            )))
+                                        }
+                                    }
                                 }
-                                SqlToken::Keyword(SqlKeyword::Autoincrement) => {
-                                    is_autoincrement = true;
-                                }
-                                SqlToken::Keyword(SqlKeyword::PrimaryKey) => {
-                                    is_primary_key = true;
-                                }
-                                token => {
-                                    return Some(Err(anyhow!(
-                                        "Expected NOT NULL, AUTOINCREMENT, or PRIMARY KEY, got {token:?}"
-                                    )))
-                                }
+
+                                Some(Ok(ColumnDef {
+                                    name,
+                                    is_nullable,
+                                    is_auto_increment: is_autoincrement,
+                                    is_primary_key,
+                                    data_type,
+                                }))
                             }
-                        }
-
-                        Some(Ok(ColumnDef {
-                            name,
-                            is_nullable,
-                            is_auto_increment: is_autoincrement,
-                            is_primary_key,
-                            data_type,
+                        })
+                        .collect::<Result<_, _>>()?;
+                    
+                        iter.next_if_eq(&SqlToken::FixedWidth(SqlFixedWidthToken::RightParen))
+                            .ok_or_else(|| anyhow!("Expected ')' after CREATE TABLE columns"))?;
+                        
+                        Ok(SqlStatement::CreateTable(CreateTableStatement {
+                            table_name,
+                            columns,
                         }))
                     }
-                })
-                .collect::<Result<_, _>>()?;
-
-                iter.next_if_eq(&SqlToken::FixedWidth(SqlFixedWidthToken::RightParen))
-                    .ok_or_else(|| anyhow!("Expected ')' after CREATE TABLE columns"))?;
-
-                Ok(SqlStatement::CreateTable(CreateTableStatement {
-                    table_name,
-                    columns,
-                }))
+                    SqlKeyword::Index => {
+                        let index_name = iter
+                            .next()
+                            .ok_or_else(|| anyhow!("Expected index name after CREATE INDEX"))?
+                            .try_as_reference()
+                            .with_context(|| "Expected index name after CREATE INDEX")?;
+                        
+                        iter.next_if_eq(&SqlToken::Keyword(SqlKeyword::On))
+                            .ok_or_else(|| anyhow!("Expected ON after CREATE INDEX"))?;
+                        
+                        let table_name = iter
+                            .next()
+                            .ok_or_else(|| anyhow!("Expected table name after CREATE INDEX ON"))?
+                            .try_as_reference()
+                            .with_context(|| "Expected table name after CREATE INDEX ON")?;
+                        
+                        iter.next_if_eq(&SqlToken::FixedWidth(SqlFixedWidthToken::LeftParen))
+                            .ok_or_else(|| anyhow!("Expected '(' after CREATE INDEX"))?;
+                        
+                        let columns = std::iter::from_fn({
+                            let mut iter = iter.by_ref().peeking_take_while(|token| match token {
+                                SqlToken::FixedWidth(SqlFixedWidthToken::RightParen) => false,
+                                _ => true,
+                            });
+                            move || {
+                                let name = match iter.next()? {
+                                    SqlToken::Reference(name) => name,
+                                    token => {
+                                        return Some(Err(anyhow!(
+                                            "Expected column name, got {token:?}"
+                                        )))
+                                    }
+                                };
+                                match iter.next() {
+                                    Some(SqlToken::FixedWidth(SqlFixedWidthToken::Comma))
+                                    | None => {}
+                                    Some(token) => {
+                                        return Some(Err(anyhow!(
+                                            "Expected ',' after column name, got {token:?}"
+                                        )));
+                                    }
+                                }
+                                Some(Ok(name))
+                            }
+                        })
+                        .collect::<Result<_, _>>()?;
+                        
+                        iter.next_if_eq(&SqlToken::FixedWidth(SqlFixedWidthToken::RightParen))
+                            .ok_or_else(|| anyhow!("Expected ')' after CREATE INDEX columns"))?;
+                        
+                        Ok(SqlStatement::CreateIndex(CreateIndexStatement {
+                            index_name,
+                            table_name,
+                            columns,
+                        }))
+                    }
+                    _ => bail!("Unexpected token after CREATE: {next_keyword:?}"),
+                }
             }
             SqlKeyword::Select => {
-                let mut selection_tokens = iter
+                let mut selections_tokens = iter
                     .by_ref()
                     .peeking_take_while(|token| match token {
                         SqlToken::Keyword(SqlKeyword::From) => false,
                         _ => true,
                     })
                     .peekable();
-
                 let selections = std::iter::from_fn(|| {
-                    let selection = match selection_tokens.next()? {
+                    let selection = match selections_tokens.next()? {
                         SqlToken::Reference(column) => Selection::Column(column),
                         SqlToken::FixedWidth(SqlFixedWidthToken::Star) => Selection::All,
                         SqlToken::Keyword(SqlKeyword::Count) => {
                             let assertions = (|| -> Result<()> {
-                                selection_tokens
+                                selections_tokens
                                     .next_if_eq(&SqlToken::FixedWidth(
                                         SqlFixedWidthToken::LeftParen,
                                     ))
                                     .ok_or_else(|| anyhow!("Expected '(*)' after COUNT"))?;
-                                selection_tokens
+                                selections_tokens
                                     .next_if_eq(&SqlToken::FixedWidth(SqlFixedWidthToken::Star))
                                     .ok_or_else(|| anyhow!("Expected '(*)' after COUNT"))?;
-                                selection_tokens
+                                selections_tokens
                                     .next_if_eq(&SqlToken::FixedWidth(
                                         SqlFixedWidthToken::RightParen,
                                     ))
@@ -385,9 +479,8 @@ impl SqlStatement {
                         }
                         token => return Some(Err(anyhow!("Expected selection, got {token:?}"))),
                     };
-
-                    if selection_tokens.peek().is_some() {
-                        let assertion = selection_tokens
+                    if selections_tokens.peek().is_some() {
+                        let assertion = selections_tokens
                             .next_if_eq(&SqlToken::FixedWidth(SqlFixedWidthToken::Comma))
                             .ok_or_else(|| anyhow!("Expected ',' after selection"));
                         if let Err(e) = assertion {
@@ -397,16 +490,13 @@ impl SqlStatement {
                     Some(Ok(selection))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-
                 iter.next_if_eq(&SqlToken::Keyword(SqlKeyword::From))
                     .ok_or_else(|| anyhow!("Expected FROM after SELECT"))?;
-
                 let table_name = match iter.next() {
                     Some(SqlToken::Reference(table_name)) => table_name,
                     Some(token) => bail!("Expected table name, got {token:?}"),
                     None => bail!("Expected table name, got EOF"),
                 };
-
                 let condition = if iter
                     .next_if_eq(&SqlToken::Keyword(SqlKeyword::Where))
                     .is_some()
@@ -417,7 +507,6 @@ impl SqlStatement {
                 } else {
                     None
                 };
-
                 Ok(SqlStatement::Select(SelectStatement {
                     table_name,
                     selections,
@@ -428,6 +517,7 @@ impl SqlStatement {
         }
     }
 }
+
 
 impl FromStr for SqlStatement {
     type Err = anyhow::Error;
