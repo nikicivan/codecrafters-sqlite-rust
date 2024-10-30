@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use itertools::*;
 use std::iter::Peekable;
 use std::str::FromStr;
-use strum::{EnumIter, EnumString, IntoEnumIterator};
+use strum::{EnumIter, EnumString, EnumTryAs, IntoEnumIterator};
 
 #[derive(Debug, PartialEq)]
 pub enum SqlStatement {
@@ -41,10 +41,19 @@ pub struct SelectStatement {
 #[derive(Debug, PartialEq)]
 pub struct CreateTableStatement {
     pub table_name: String,
-    pub columns: Vec<String>,
+    pub columns: Vec<ColumnDef>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnDef {
+    pub name: String,
+    pub data_type: Option<String>,
+    pub is_auto_increment: bool,
+    pub is_nullable: bool,
+    pub is_primary_key: bool,
+}
+
+#[derive(Debug, PartialEq, EnumTryAs)]
 enum SqlToken {
     Keyword(SqlKeyword),
     Reference(String),
@@ -71,7 +80,7 @@ pub enum SqlValue {
     Integer(i128),
 }
 
-#[derive(Debug, EnumString, strum::Display, EnumIter, PartialEq)]
+#[derive(Debug, EnumString, strum::Display, EnumIter, PartialEq, EnumTryAs)]
 enum SqlKeyword {
     #[strum(serialize = "SELECT")]
     Select,
@@ -89,6 +98,12 @@ enum SqlKeyword {
     Or,
     #[strum(serialize = "TABLE")]
     Table,
+    #[strum(serialize = "NOT NULL")]
+    NotNull,
+    #[strum(serialize = "AUTOINCREMENT")]
+    Autoincrement,
+    #[strum(serialize = "PRIMARY KEY")]
+    PrimaryKey,
 }
 
 fn is_valid_identifier_char(c: char) -> bool {
@@ -141,6 +156,11 @@ impl SqlToken {
 
                     cursor += end;
                     SqlToken::Reference(s[..end].to_string())
+                }
+                s if s.starts_with('"') => {
+                    let end_index = s[1..].find('"').expect("Unterminated reference") + 1;
+                    cursor += end_index + 1;
+                    SqlToken::Reference(s[1..end_index].to_string())
                 }
                 s if s.starts_with('\'') => {
                     let end_index = s[1..].find('\'').expect("Unterminated string") + 1;
@@ -261,18 +281,61 @@ impl SqlStatement {
                         SqlToken::FixedWidth(SqlFixedWidthToken::RightParen) => false,
                         _ => true,
                     });
+
                     move || {
-                        let column = match iter.next()? {
+                        let name = match iter.next()? {
                             SqlToken::Reference(column) => column.clone(),
                             token => return Some(Err(anyhow!("Expected column, got {token:?}"))),
                         };
-                        iter.by_ref()
-                            .take_while(|token| match token {
-                                SqlToken::FixedWidth(SqlFixedWidthToken::Comma) => false,
-                                _ => true,
+
+                        let mut iter = iter.by_ref().take_while(|token| match token {
+                            SqlToken::FixedWidth(SqlFixedWidthToken::Comma) => false,
+                            _ => true,
+                        });
+
+                        let mut is_nullable = true;
+                        let mut is_autoincrement = false;
+                        let mut is_primary_key = false;
+                        let data_type = iter
+                            .next()
+                            .map(|token| {
+                                token.try_as_reference_ref().cloned().ok_or_else(|| {
+                                    anyhow!("Expected data type to be reference, got {token:?}")
+                                })
                             })
-                            .count();
-                        Some(Ok(column))
+                            .transpose();
+
+                        let data_type = match data_type {
+                            Ok(data_type) => data_type,
+                            Err(e) => return Some(Err(e)),
+                        };
+
+                        for token in iter {
+                            match token {
+                                SqlToken::Keyword(SqlKeyword::NotNull) => {
+                                    is_nullable = false;
+                                }
+                                SqlToken::Keyword(SqlKeyword::Autoincrement) => {
+                                    is_autoincrement = true;
+                                }
+                                SqlToken::Keyword(SqlKeyword::PrimaryKey) => {
+                                    is_primary_key = true;
+                                }
+                                token => {
+                                    return Some(Err(anyhow!(
+                                        "Expected NOT NULL, AUTOINCREMENT, or PRIMARY KEY, got {token:?}"
+                                    )))
+                                }
+                            }
+                        }
+
+                        Some(Ok(ColumnDef {
+                            name,
+                            is_nullable,
+                            is_auto_increment: is_autoincrement,
+                            is_primary_key,
+                            data_type,
+                        }))
                     }
                 })
                 .collect::<Result<_, _>>()?;
@@ -374,7 +437,7 @@ impl FromStr for SqlStatement {
             .with_context(|| format!("Failed to parse SQL statement from {s:?}"))?;
 
         #[cfg(debug_assertions)]
-        println!("tokens: {:?}", tokens);
+        eprintln!("tokens: {:?}", tokens);
 
         SqlStatement::from_tokens(tokens.into_iter())
             .with_context(|| format!("Failed to parse SQL statement from string {s:?}"))

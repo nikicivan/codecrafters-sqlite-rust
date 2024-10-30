@@ -4,7 +4,10 @@ use crate::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use std::{collections::HashMap, str::FromStr};
+use strum::EnumIs;
 use thiserror::Error;
+
+use super::sql::ColumnDef;
 
 const MAGIC_STRING_LEN: usize = 16;
 const MAGIC_STRING: [u8; MAGIC_STRING_LEN] = *b"SQLite format 3\0";
@@ -106,37 +109,58 @@ impl ReadFromBytes for DatabaseHeader {
             }
         }
         let page_size = ReadFromBytes::read_from_bytes(bytes, index)?;
+
         let file_format_write_version =
             FileFormatVersion::try_from(u8::read_from_bytes(bytes, index)?)
                 .map_err(HeaderParseError::InvalidFileFormatReadVersion)?;
+
         let file_format_read_version =
             FileFormatVersion::try_from(u8::read_from_bytes(bytes, index)?)
                 .map_err(HeaderParseError::InvalidFileFormatWriteVersion)?;
+
         let reserved_space_per_page = ReadFromBytes::read_from_bytes(bytes, index)?;
+
         let max_embedded_payload_fraction = ReadFromBytes::read_from_bytes(bytes, index)?;
+
         let min_embedded_payload_fraction = ReadFromBytes::read_from_bytes(bytes, index)?;
+
         let leaf_payload_fraction = ReadFromBytes::read_from_bytes(bytes, index)?;
+
         let file_change_counter = ReadFromBytes::read_from_bytes(bytes, index)?;
+
         let database_size_in_pages = ReadFromBytes::read_from_bytes(bytes, index)?;
+
         let first_freelist_trunk_page = ReadFromBytes::read_from_bytes(bytes, index)?;
+
         let total_freelist_pages = ReadFromBytes::read_from_bytes(bytes, index)?;
+
         let schema_cookie = ReadFromBytes::read_from_bytes(bytes, index)?;
+
         let schema_format_number = ReadFromBytes::read_from_bytes(bytes, index)?;
+
         let default_page_cache_size = ReadFromBytes::read_from_bytes(bytes, index)?;
+
         let largest_btree_page_number = ReadFromBytes::read_from_bytes(bytes, index)?;
+
         let database_text_encoding =
             DatabaseEncoding::try_from(u32::read_from_bytes(bytes, index)?)
                 .map_err(HeaderParseError::InvalidDatabaseTextEncoding)?;
+
         let user_version = ReadFromBytes::read_from_bytes(bytes, index)?;
+
         let is_incremental_vacuum = u32::read_from_bytes(bytes, index)? != 0;
+
         let application_id = ReadFromBytes::read_from_bytes(bytes, index)?;
+
         // skip 20 reserved bytes
         for _ in 0..20 {
             if u8::read_from_bytes(bytes, index)? != 0 {
                 Err(HeaderParseError::InvalidReservedBytes)?;
             }
         }
+
         let version_valid_for = ReadFromBytes::read_from_bytes(bytes, index)?;
+
         let sqlite_version_number = ReadFromBytes::read_from_bytes(bytes, index)?;
         Ok(DatabaseHeader {
             page_size,
@@ -203,48 +227,97 @@ impl TryFrom<u8> for PageType {
 
 #[derive(Debug)]
 pub struct LeafTable {
-    pub page_header: PageHeader,
-    pub cells: Vec<Cell>,
+    pub cells: Vec<LeafTableCell>,
+}
+
+#[derive(Debug)]
+pub struct InteriorTable {
+    pub pages: Vec<Page>,
 }
 
 #[derive(Debug)]
 pub enum Page {
-    // InteriorIndex,
-    // InteriorTable,
-    // LeafIndex,
+    InteriorIndex,
+    InteriorTable(InteriorTable),
+    LeafIndex,
     LeafTable(LeafTable),
 }
 
 impl Page {
+    fn leaf_table_cells(self) -> Vec<LeafTableCell> {
+        match self {
+            Self::LeafTable(LeafTable { cells, .. }) => cells.into_iter().collect(),
+            Self::InteriorTable(InteriorTable { pages }) => pages
+                .into_iter()
+                .flat_map(|page| page.leaf_table_cells())
+                .collect(),
+            _ => vec![],
+        }
+    }
+
     pub fn read_from_bytes(
         bytes: &[u8],
         index: &mut usize,
-        text_encoding: &DatabaseEncoding,
+        db_header: &DatabaseHeader,
         base_offset: usize,
     ) -> Result<Self> {
         let page_header = PageHeader::read_from_bytes(bytes, index)?;
+
         #[cfg(debug_assertions)]
         eprintln!("page_header: {page_header:?}");
-        assert_eq!(
-            page_header.page_type,
-            PageType::LeafTable,
-            "Only LeafTable pages are currently supported"
-        );
+
         let cell_pointers = (0..page_header.number_of_cells)
             .map(|_| u16::read_from_bytes(bytes, index))
             .collect::<Result<Vec<_>>>()
             .with_context(|| "Failed to read cell pointers")?;
-        #[cfg(debug_assertions)]
-        eprintln!("cell_pointers: {cell_pointers:?}");
-        let cells = cell_pointers
-            .iter()
-            .map(|&offset| {
-                let mut index = base_offset + usize::from(offset);
-                Cell::read_from_bytes(bytes, &mut index, text_encoding)
-            })
-            .collect::<Result<Vec<_>>>()
-            .with_context(|| "Failed to read cells")?;
-        Ok(Self::LeafTable(LeafTable { page_header, cells }))
+
+        match page_header.page_type {
+            PageType::LeafTable => {
+                #[cfg(debug_assertions)]
+                eprintln!("cell_pointers: {cell_pointers:?}");
+
+                let cells = cell_pointers
+                    .iter()
+                    .map(|&offset| {
+                        let mut index = base_offset + usize::from(offset);
+
+                        LeafTableCell::read_from_bytes(
+                            bytes,
+                            &mut index,
+                            &db_header.database_text_encoding,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()
+                    .with_context(|| "Failed to read cells")?;
+
+                Ok(Self::LeafTable(LeafTable { cells }))
+            }
+            PageType::InteriorTable => {
+                let pages = cell_pointers
+                    .iter()
+                    .map(|&offset| {
+                        let mut index = base_offset + usize::from(offset);
+                        u32::read_from_bytes(bytes, &mut index)
+                    })
+                    .chain(std::iter::once(page_header.right_most_pointer.ok_or_else(
+                        || anyhow!("Expected right most pointer for InteriorTable page"),
+                    )))
+                    .map(|page_number| {
+                        let base_offset =
+                            ((page_number? - 1) as usize) * usize::from(db_header.page_size);
+                        Page::read_from_bytes(
+                            bytes,
+                            &mut base_offset.clone(),
+                            db_header,
+                            base_offset,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Self::InteriorTable(InteriorTable { pages }))
+            }
+            PageType::InteriorIndex => Ok(Self::InteriorIndex),
+            PageType::LeafIndex => Ok(Self::LeafIndex),
+        }
     }
 }
 
@@ -310,7 +383,7 @@ impl ReadFromBytes for Varint {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, EnumIs)]
 pub enum SerialType {
     Null,
     U8(u8),
@@ -504,13 +577,13 @@ impl Record {
 }
 
 #[derive(Debug)]
-pub struct Cell {
+pub struct LeafTableCell {
     #[allow(dead_code)]
     row_id: Varint,
     pub record: Record,
 }
 
-impl Cell {
+impl LeafTableCell {
     fn read_from_bytes(
         bytes: &[u8],
         index: &mut usize,
@@ -520,15 +593,21 @@ impl Cell {
             .0
             .try_into()
             .with_context(|| format!("Failed to convert cell size to usize"))?;
+
         #[cfg(debug_assertions)]
         eprintln!("cell_size: {}", size);
+
         let row_id = Varint::read_from_bytes(bytes, index)?;
+
         #[cfg(debug_assertions)]
         eprintln!("row_id: {:?}", row_id);
+
         let initial_index = *index;
         let record = Record::read_from_bytes(bytes, index, text_encoding)?;
+
         #[cfg(debug_assertions)]
         eprintln!("record: {:?}", record);
+
         if *index - initial_index != size {
             bail!(
                 "Expected cell payload size to be {}, got {}",
@@ -536,11 +615,119 @@ impl Cell {
                 *index - initial_index
             );
         }
-        Ok(Cell { row_id, record })
+        Ok(LeafTableCell { row_id, record })
     }
 }
 
-type Row = HashMap<String, SerialType>;
+#[derive(Debug)]
+pub struct Row {
+    row_id: u64,
+    data: HashMap<String, SerialType>,
+    primary_key_column: Option<String>,
+}
+
+impl Row {
+    fn get(&self, column: &str) -> Option<SerialType> {
+        let row_data = self.data.get(column);
+        row_data.cloned().map(|val| {
+            if val.is_null()
+                && self
+                    .primary_key_column
+                    .as_ref()
+                    .map_or(false, |v| v == column)
+            {
+                SerialType::U64(self.row_id)
+            } else {
+                val
+            }
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct TableMetadata {
+    entry_type: String,
+    name: String,
+    table_name: String,
+    root_page: u8,
+    sql: String,
+}
+
+impl TableMetadata {
+    fn sqlite_schema_metadata() -> Self {
+        Self {
+            entry_type: "table".to_string(),
+            name: "sqlite_schema".to_string(),
+            table_name: "sqlite_schema".to_string(),
+            root_page: 1,
+            sql: "CREATE TABLE sqlite_schema(\n\
+                type text,\n\
+                name text,\n\
+                tbl_name text,\n\
+                rootpage integer,\n\
+                sql text\n\
+            )"
+            .to_string(),
+        }
+    }
+
+    fn from_sqlite_schema(row: &Row) -> Result<Self> {
+        let entry_type = match row
+            .get("type")
+            .ok_or_else(|| anyhow!("Missing type column"))?
+        {
+            SerialType::Text(name) => name,
+            _ => bail!("Expected type to be a text"),
+        }
+        .clone();
+
+        let name = match row
+            .get("name")
+            .ok_or_else(|| anyhow!("Missing name column"))?
+        {
+            SerialType::Text(name) => name,
+            _ => bail!("Expected table name to be a text"),
+        }
+        .clone();
+
+        let table_name = match row
+            .get("tbl_name")
+            .ok_or_else(|| anyhow!("Missing tbl_name column"))?
+        {
+            SerialType::Text(table_name) => table_name,
+            _ => bail!("Expected table name to be a text"),
+        }
+        .clone();
+
+        let root_page = match row
+            .get("rootpage")
+            .ok_or_else(|| anyhow!("Missing rootpage column"))?
+        {
+            SerialType::U8(root_page) => root_page,
+            _ => bail!("Expected root page to be a u8"),
+        }
+        .clone();
+
+        let sql = match row
+            .get("sql")
+            .ok_or_else(|| anyhow!("Missing sql column"))?
+        {
+            SerialType::Text(sql) => sql,
+            _ => bail!("Expected SQL to be a text"),
+        }
+        .clone()
+        .trim()
+        .to_string();
+
+        Ok(TableMetadata {
+            entry_type,
+            name,
+            table_name,
+            root_page,
+            sql,
+        })
+    }
+}
 
 #[derive(Debug)]
 pub struct TableData {
@@ -552,70 +739,64 @@ pub struct TableData {
     #[allow(dead_code)]
     sql: String,
     pub data: Vec<Row>,
-    pub column_names: Vec<String>,
+    pub columns: ColumnDefMap,
 }
 
-impl TableData {
-    pub fn read(cols: &Vec<SerialType>, db_header: &DatabaseHeader, bytes: &[u8]) -> Result<Self> {
-        #[cfg(debug_assertions)]
-        eprintln!("TableData::try_from({:?})", cols);
+type ColumnDefMap = HashMap<String, ColumnDef>;
 
-        match &cols[0] {
-            SerialType::Text(name) if name == "table" => {}
-            SerialType::Text(name) => bail!("Expected type to be \"table\", got {name:?}"),
-            _ => bail!("Expected type to be a text"),
+impl TableData {
+    pub fn read(metadata: TableMetadata, db_header: &DatabaseHeader, bytes: &[u8]) -> Result<Self> {
+        let TableMetadata {
+            entry_type,
+            name,
+            table_name,
+            root_page,
+            sql,
+        } = metadata;
+
+        if entry_type != "table" {
+            panic!("Expected entry type to be \"table\", got {entry_type:?}");
+        }
+
+        let columns = if let SqlStatement::CreateTable(create_table) = SqlStatement::from_str(&sql)?
+        {
+            create_table.columns
+        } else {
+            bail!("Expected SQL to be a CREATE TABLE statement");
         };
 
-        let name = match &cols[1] {
-            SerialType::Text(name) => name,
-            _ => bail!("Expected table name to be a text"),
-        }
-        .clone();
+        let primary_key_column = columns
+            .iter()
+            .find(|column| column.is_primary_key)
+            .map(|column| column.name.clone());
 
-        let table_name = match &cols[2] {
-            SerialType::Text(table_name) => table_name,
-            _ => bail!("Expected table name to be a text"),
-        }
-        .clone();
+        let base_offset = usize::from(root_page - 1) * usize::from(db_header.page_size);
 
-        let root_page = match &cols[3] {
-            SerialType::U8(root_page) => root_page,
-            _ => bail!("Expected root page to be a u8"),
-        }
-        .clone();
+        let page_offset = if root_page == 1 {
+            base_offset + 100
+        } else {
+            base_offset
+        };
 
-        let sql = match &cols[4] {
-            SerialType::Text(sql) => sql,
-            _ => bail!("Expected SQL to be a text"),
-        }
-        .clone()
-        .trim()
-        .to_string();
+        let page = Page::read_from_bytes(bytes, &mut page_offset.clone(), &db_header, base_offset)?;
 
-        let column_names =
-            if let SqlStatement::CreateTable(create_table) = SqlStatement::from_str(&sql)? {
-                create_table.columns
-            } else {
-                bail!("Expected SQL to be a CREATE TABLE statement");
-            };
-
-        let page_offset = usize::from(root_page - 1) * usize::from(db_header.page_size);
-
-        let Page::LeafTable(LeafTable { cells, .. }) = Page::read_from_bytes(
-            bytes,
-            &mut page_offset.clone(),
-            &db_header.database_text_encoding,
-            page_offset,
-        )?;
+        let cells = page.leaf_table_cells();
 
         let data = cells
             .into_iter()
-            .map(|cell| {
-                std::iter::zip(column_names.iter(), cell.record.0.iter())
-                    .map(|(name, value)| (name.clone(), value.clone()))
-                    .collect::<HashMap<_, _>>()
+            .map(|cell| Row {
+                data: std::iter::zip(columns.iter(), cell.record.0.into_iter())
+                    .map(|(name, value)| (name.name.clone(), value))
+                    .collect::<HashMap<_, _>>(),
+                row_id: cell.row_id.0,
+                primary_key_column: primary_key_column.clone(),
             })
             .collect::<Vec<_>>();
+
+        let columns = columns
+            .into_iter()
+            .map(|column| (column.name.clone(), column))
+            .collect::<HashMap<_, _>>();
 
         Ok(Self {
             name,
@@ -623,35 +804,36 @@ impl TableData {
             root_page,
             sql,
             data,
-            column_names,
+            columns,
         })
     }
 }
 
 pub struct Database {
     pub header: DatabaseHeader,
-    pub schema_page: LeafTable,
     pub tables: HashMap<String, TableData>,
 }
 
 impl ReadFromBytes for Database {
     fn read_from_bytes(bytes: &[u8], index: &mut usize) -> Result<Self> {
         let header = DatabaseHeader::read_from_bytes(&bytes, index)?;
-        let Page::LeafTable(schema_page) =
-            Page::read_from_bytes(&bytes, index, &header.database_text_encoding, 0)?;
-        let tables = schema_page
-            .cells
+
+        let schema_sqlite =
+            TableData::read(TableMetadata::sqlite_schema_metadata(), &header, bytes)?;
+
+        let mut tables = schema_sqlite
+            .data
             .iter()
-            .map(|cell| {
-                let table_data = TableData::read(&cell.record.0, &header, &bytes)?;
+            .map(|row| {
+                let table_data =
+                    TableData::read(TableMetadata::from_sqlite_schema(row)?, &header, &bytes)?;
                 Ok((table_data.table_name.clone(), table_data))
             })
             .collect::<Result<HashMap<_, _>>>()?;
-        Ok(Self {
-            header,
-            schema_page,
-            tables,
-        })
+
+        tables.insert(schema_sqlite.table_name.clone(), schema_sqlite);
+
+        Ok(Self { header, tables })
     }
 }
 
@@ -678,7 +860,7 @@ impl PartialEq<SqlValue> for SerialType {
 fn evaluate_condition(row: &Row, condition: &Condition) -> bool {
     match condition {
         Condition::Simple(condition) => match condition {
-            SimpleCondition::Equal(column, value) => row.get(column).map_or(false, |v| v == value),
+            SimpleCondition::Equal(column, value) => row.get(column).map_or(false, |v| &v == value),
         },
         Condition::And(left, right) => {
             evaluate_condition(row, left) && evaluate_condition(row, right)
@@ -690,11 +872,23 @@ fn evaluate_condition(row: &Row, condition: &Condition) -> bool {
 }
 
 impl Database {
-    pub fn table_names(&self) -> Vec<String> {
-        self.schema_page
-            .cells
+    pub fn sqlite_schema_table(&self) -> Result<&TableData> {
+        self.tables
+            .get("sqlite_schema")
+            .ok_or_else(|| anyhow!("'sqlite_schema' table not found"))
+    }
+
+    pub fn table_names(&self) -> Result<Vec<String>> {
+        Database::sqlite_schema_table(&self)?
+            .data
             .iter()
-            .map(|cell| cell.record.0[2].to_string())
+            .map(|cell| {
+                if let SerialType::Text(name) = cell.get("name").ok_or_else(|| anyhow!("name"))? {
+                    Ok(name.clone())
+                } else {
+                    bail!("Expected table name to be a text")
+                }
+            })
             .collect()
     }
 
@@ -724,7 +918,10 @@ impl Database {
             if select_stmt.selections.len() != 1 {
                 bail!("When COUNT(*) is selected, it must be the only selection");
             }
-            Ok(vec![vec![SerialType::U64(rows.count() as u64)]])
+            Ok(vec![vec![SerialType::U64(
+                u64::try_from(rows.count())
+                    .with_context(|| "Failed to convert 'SELECT COUNT(*)'`s row count to u64")?,
+            )]])
         } else {
             rows.map(|row| {
                 Ok(select_stmt
@@ -733,11 +930,10 @@ impl Database {
                     .map(|selection| -> Result<Vec<_>, _> {
                         Ok(match selection {
                             Selection::All => table
-                                .column_names
-                                .iter()
-                                .map(|col| {
-                                    row.get(col)
-                                        .cloned()
+                                .columns
+                                .keys()
+                                .map(|col_name| {
+                                    row.get(&col_name)
                                         .ok_or_else(|| anyhow!("Column not found"))
                                 })
                                 .collect::<Result<_, _>>()
@@ -748,7 +944,7 @@ impl Database {
                                 bail!("COUNT(*) must be the only selection")
                             }
                             Selection::Column(name) => {
-                                vec![row.get(name).cloned().unwrap_or(SerialType::Null)]
+                                vec![row.get(name).unwrap_or(SerialType::Null)]
                             }
                         })
                     })

@@ -40,17 +40,14 @@ fn main() -> Result<()> {
             let db = Database::read_from_bytes(&contents, &mut index)?;
 
             println!("database page size: {}", db.header.page_size);
-            println!(
-                "number of tables: {}",
-                db.schema_page.page_header.number_of_cells
-            );
+            println!("number of tables: {}", db.sqlite_schema_table()?.data.len());
         }
         ".tables" => {
             let mut index = 0;
 
             let db = Database::read_from_bytes(&contents, &mut index)?;
 
-            println!("{}", db.table_names().join(" "));
+            println!("{}", db.table_names()?.join(" "));
         }
         query => {
             let mut index = 0;
@@ -63,7 +60,7 @@ fn main() -> Result<()> {
                 SqlStatement::from_str(&query).with_context(|| "main: Failed to parse query")?;
 
             #[cfg(debug_assertions)]
-            println!("Executing query: {:?}", query);
+            eprintln!("Executing query: {:?}", query);
 
             let result = db.run_query(query)?;
 
